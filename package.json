@@ -1,0 +1,11 @@
+{
+  "name": "bitrix-deal-dashboard",
+  "version": "1.0.0",
+  "description": "Dashboard воронки продаж для Битрикс24 (VibeCode)",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  }
+}

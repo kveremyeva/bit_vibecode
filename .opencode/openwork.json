@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "workspace": {
+    "name": "Компетенция вайбкод",
+    "createdAt": 1788867099982,
+    "preset": "starter"
+  },
+  "authorizedRoots": [
+    "C:\\Users\\verks\\Documents\\Bitrix24 CoworkCode\\Компетенция вайбкод"
+  ],
+  "reload": null
+}
