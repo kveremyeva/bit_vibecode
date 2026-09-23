@@ -69,6 +69,34 @@ class PortalError extends Error {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Диагностический вариант portal(): возвращает сырой текст и статус,
+// не бросая исключений. Используется только дебаг-маршрутом.
+async function portalRaw(pathname, { method = "GET", body, session } = {}) {
+  if (!KEY || !BASE)
+    return { status: 503, text: '{"error":"no_key"}' };
+  const url = new URL(`${BASE}${pathname}`);
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), PORTAL_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      method,
+      headers: {
+        "X-Api-Key": KEY,
+        Accept: "application/json",
+        ...(body ? { "Content-Type": "application/json" } : {}),
+        ...(session ? { "X-Vibe-Authorization": session } : {}),
+      },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+      signal: ctl.signal,
+    });
+    return { status: res.status, text: await res.text() };
+  } catch (err) {
+    return { status: 0, text: String(err.message) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // Запрос к порталу. Дополнительный заголовок X-Vibe-Authorization (сессия
 // шлюза) пробрасывается вместе с ключом приложения: тогда портал отдаёт
 // данные именно того пользователя, который открыл приложение.
@@ -296,10 +324,7 @@ async function aggregatePeriod({ session, from, to, stageIndex }) {
   const filter = { createdAt: { $gte: from, $lte: to } };
   const body = {
     filter,
-    aggregate: [
-      { field: "amount", function: "sum" },
-      { field: "id", function: "count" },
-    ],
+    aggregate: [{ field: "amount", function: "sum" }],
     groupBy: "stageId",
   };
   return portal("/deals/aggregate", { method: "POST", body, session });
@@ -520,6 +545,33 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === "/api/meta") {
     const entry = getOrCreate(key);
     writeJson(res, 200, { domain: DOMAIN });
+    return;
+  }
+
+  // --- /api/debug/aggregate: временная диагностика (только для отладки) ---
+  if (url.pathname === "/api/debug/aggregate") {
+    try {
+      const from = url.searchParams.get("from") || "2026-08-01T00:00:00.000Z";
+      const to = url.searchParams.get("to") || "2026-09-30T23:59:59.999Z";
+      const raw = await portalRaw("/deals/aggregate", {
+        method: "POST",
+        body: {
+          filter: { createdAt: { $gte: from, $lte: to } },
+          aggregate: [{ field: "amount", function: "sum" }],
+          groupBy: "stageId",
+        },
+        session,
+      });
+      writeJson(res, 200, { ok: true, response: raw.text, status: raw.status });
+    } catch (err) {
+      writeJson(res, 200, {
+        ok: false,
+        kind: err.kind || "unknown",
+        message: err.message,
+        status: err.status ?? null,
+      });
+    }
+    return;
   }
 
   // --- статика только из public/ -----------------------------------------
