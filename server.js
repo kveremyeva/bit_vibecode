@@ -209,12 +209,20 @@ function normalizeDateFields(deal) {
   return out;
 }
 
-// ---- словари (стадии, пользователи) ----------------------------------------
-async function fetchStageDictionaries(session) {
-  const { value: categories } = await portal("/deal-categories", {
-    params: { limit: 100 },
-    session,
-  });
+// ---- словари (стадии, воронки, пользователи) -------------------------------
+// Справочники не зависят от конкретного пользователя, поэтому их тянем по
+// ключу приложения (без сессии) и устойчиво: отказ словаря не роняет refresh,
+// а лишь помечается (M1). Сессия пробрасывается только к запросам сделок.
+async function fetchStageDictionaries() {
+  let categories = [];
+  let categoriesError = null;
+  try {
+    const res = await portal("/deal-categories", { params: { limit: 100 } });
+    categories = res.value || [];
+  } catch (err) {
+    categoriesError = err.kind || "portal_error";
+    console.log(`[fetch] deal-categories failed: ${err.kind} — ${err.message}`);
+  }
   const ids = new Set([0]);
   for (const cat of categories || []) {
     if (cat?.id != null) ids.add(cat.id);
@@ -230,19 +238,18 @@ async function fetchStageDictionaries(session) {
       const { value } = await portal("/statuses/search", {
         method: "POST",
         body: { filter: { entityId: dict.entityId }, sort: { sort: "asc" }, limit: 200 },
-        session,
       });
       stages.push(...value.map((s) => ({ ...s, categoryId: dict.categoryId })));
     } catch (err) {
       // M1: не проглатываем отказ словаря — запоминаем и покажем пользователю.
-      stageError = stageError || err.kind || "portal_error";
+      stageError = stageError || categoriesError || err.kind || "portal_error";
       console.log(`[fetch] stages ${dict.entityId} failed: ${err.kind} — ${err.message}`);
     }
   }
-  return { categories: categories || [], stages, stageError };
+  return { categories, stages, stageError: stageError || categoriesError };
 }
 
-async function fetchUserNames(ids, session) {
+async function fetchUserNames(ids) {
   const distinct = [...new Set(ids.filter((v) => v != null && v !== ""))];
   const users = [];
   for (let i = 0; i < distinct.length; i += 50) {
@@ -252,7 +259,6 @@ async function fetchUserNames(ids, session) {
       const { value } = await portal("/users/search", {
         method: "POST",
         body: { filter: { id: { $in: chunk } }, limit: 50 },
-        session,
       });
       users.push(...value);
       ok = true;
@@ -313,20 +319,16 @@ async function recentDeals({ session, from, to }) {
   return value.map(normalizeDateFields);
 }
 
-async function buildSnapshotForKey(key, session) {
+async function buildSnapshotForKey(key) {
   const entry = getOrCreate(key);
   if (entry.building) return;
   entry.building = true;
   try {
-    const stageDefs = await fetchStageDictionaries(session);
-    const recent = await recentDeals({ session, from: "2000-01-01T00:00:00.000Z", to: "9999-12-31T23:59:59.999Z" });
-    const responsibleIds = recent.map((d) => d.responsibleId ?? d.assignedById);
-    const users = await fetchUserNames(responsibleIds, session);
+    const stageDefs = await fetchStageDictionaries();
     entry.data = {
       stages: stageDefs.stages,
       categories: stageDefs.categories,
       stageError: stageDefs.stageError,
-      users,
       domain: DOMAIN,
       fetchedAt: new Date().toISOString(),
     };
@@ -344,20 +346,15 @@ async function refresh() {
   const keys = userCache.size ? [...userCache.keys()] : ["local"];
   for (const key of keys) {
     const entry = userCache.get(key) || getOrCreate(key);
-    // Локальному/сервисному кэшу сессии не нужно; для user-кэша храним сессию
-    // отдельно от обычного ответа.
     if (entry.building) continue;
-    const sessionKnown = key === "local" ? null : entry.session ?? null;
-    await buildSnapshotForKey(key, sessionKnown);
+    await buildSnapshotForKey(key);
     await sleep(50);
   }
 }
 
 async function dashboardFor({ key, session, period, from, to }) {
   const entry = getOrCreate(key);
-  if (session) entry.session = session; // для фоновых обновлений
   const stageIndex = buildStageIndex(entry.data?.stages);
-  const usersIndex = buildUsersIndex(entry.data?.users);
   const range = resolvePeriod(period, from, to);
   if (!range) {
     return {
@@ -383,6 +380,11 @@ async function dashboardFor({ key, session, period, from, to }) {
   const openSum = openGroups.reduce((s, g) => s + g.sum, 0);
 
   const recentRes = await recentDeals({ session, from: iso.from, to: iso.to });
+  const respIds = recentRes
+    .map((d) => d.responsibleId ?? d.assignedById)
+    .filter((v) => v != null);
+  const respUsers = await fetchUserNames(respIds);
+  const usersIndex = buildUsersIndex(respUsers);
   const recent = recentRes.map((d) => {
     const stageId = d.stageId ?? "";
     const meta = stageIndex.byCode.get(stageId);
@@ -463,8 +465,7 @@ const server = http.createServer(async (req, res) => {
     if (!entry.data) {
       // Первое обращение пользователя — соберём словари.
       if (!entry.building) {
-        entry.session = session;
-        void buildSnapshotForKey(key, session);
+        void buildSnapshotForKey(key);
       }
       const kind = entry.error?.kind ?? (KEY && BASE ? "loading" : "no_key");
       if (kind === "loading") {
