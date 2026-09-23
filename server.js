@@ -3,16 +3,7 @@ import { readFile } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import {
-  buildStageIndex,
-  buildUsersIndex,
-  computeFunnel,
-  computeKpi,
-  computeRecent,
-  filterByPeriod,
-  isoRange,
-  resolvePeriod,
-} from "./lib/calc.js";
+import { buildStageIndex, buildUsersIndex, isoRange, resolvePeriod } from "./lib/calc.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -52,7 +43,8 @@ const KEY = process.env.BITRIX_API_KEY || "";
 const DOMAIN = process.env.BITRIX_PORTAL_DOMAIN || "";
 const PUBLIC_DIR = path.join(__dirname, "public");
 const PORTAL_TIMEOUT_MS = Number(process.env.PORTAL_TIMEOUT_MS || 180_000);
-const REFRESH_MS = Number(process.env.REFRESH_MS || 5 * 60_000);
+const CACHE_MS = Number(process.env.CACHE_MS || 5 * 60_000);
+const AGG_LIMIT = 5000;
 
 console.log(
   KEY
@@ -71,65 +63,95 @@ class PortalError extends Error {
     super(message);
     this.kind = kind;
     this.status = status ?? null;
+    this.retryAfter = null;
   }
 }
 
-async function portal(pathname, { method = "GET", body, params } = {}) {
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Запрос к порталу. Дополнительный заголовок X-Vibe-Authorization (сессия
+// шлюза) пробрасывается вместе с ключом приложения: тогда портал отдаёт
+// данные именно того пользователя, который открыл приложение.
+async function portal(pathname, { method = "GET", body, params, session } = {}) {
   if (!KEY || !BASE) throw new PortalError("no_key", "portal env vars are absent");
-  const url = new URL(`${BASE}${pathname}`);
-  if (params) {
-    for (const [k, v] of Object.entries(params)) url.searchParams.set(k, String(v));
-  }
-  const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), PORTAL_TIMEOUT_MS);
-  const startedAt = Date.now();
-  let res;
-  try {
-    res = await fetch(url, {
-      method,
-      headers: {
-        "X-Api-Key": KEY,
-        Accept: "application/json",
-        ...(body ? { "Content-Type": "application/json" } : {}),
-      },
-      ...(body ? { body: JSON.stringify(body) } : {}),
-      signal: ctl.signal,
-    });
-  } catch (err) {
-    const kind = err?.name === "AbortError" ? "timeout" : "unreachable";
-    throw new PortalError(kind, `${pathname} ${kind} after ${Date.now() - startedAt}ms`);
-  } finally {
-    clearTimeout(timer);
-  }
+  const build = async () => {
+    const url = new URL(`${BASE}${pathname}`);
+    if (params) {
+      for (const [k, v] of Object.entries(params))
+        url.searchParams.set(k, String(v));
+    }
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), PORTAL_TIMEOUT_MS);
+    const startedAt = Date.now();
+    let res;
+    try {
+      res = await fetch(url, {
+        method,
+        headers: {
+          "X-Api-Key": KEY,
+          Accept: "application/json",
+          ...(body ? { "Content-Type": "application/json" } : {}),
+          ...(session ? { "X-Vibe-Authorization": session } : {}),
+        },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+        signal: ctl.signal,
+      });
+    } catch (err) {
+      const kind = err?.name === "AbortError" ? "timeout" : "unreachable";
+      throw new PortalError(kind, `${pathname} ${kind} after ${Date.now() - startedAt}ms`);
+    } finally {
+      clearTimeout(timer);
+    }
 
-  const text = await res.text();
-  let data = null;
-  try {
-    data = text ? JSON.parse(text) : null;
-  } catch {
-    data = null;
-  }
+    const text = await res.text();
+    let data = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = null;
+    }
 
-  if (!res.ok) {
-    const kind =
-      res.status === 429
-        ? "rate_limited"
-        : res.status === 401 || res.status === 403
+    if (!res.ok) {
+      // M6: 401 (сессия/ключ) и 403 (не хватает прав) — разные ситуации.
+      // M3: 429 — единственный статус, который стоит повторить после паузы.
+      if (res.status === 429) {
+        const retryAfter = Number(res.headers.get("retry-after")) || null;
+        const pe = new PortalError("rate_limited", "rate limited", 429);
+        pe.retryAfter = retryAfter;
+        throw pe;
+      }
+      const kind =
+        res.status === 401
           ? "denied"
-          : "portal_error";
-    throw new PortalError(
-      kind,
-      data?.error?.message || `portal_error_${res.status}`,
-      res.status,
-    );
-  }
-  console.log(`[portal] ${pathname} -> ${res.status} in ${Date.now() - startedAt}ms`);
-  // Один стабильный распаковщик: data может быть массивом, объектом с items/data.
-  const payload = data?.data ?? data;
-  return {
-    value: Array.isArray(payload) ? payload : (payload?.items ?? payload ?? []),
-    meta: data?.meta ?? null,
+          : res.status === 403
+            ? "forbidden"
+            : "portal_error";
+      throw new PortalError(
+        kind,
+        data?.error?.message || `portal_error_${res.status}`,
+        res.status,
+      );
+    }
+
+    console.log(`[portal] ${pathname} -> ${res.status} in ${Date.now() - startedAt}ms`);
+    const payload = data?.data ?? data;
+    return {
+      value: Array.isArray(payload) ? payload : (payload?.items ?? payload ?? []),
+      meta: data?.meta ?? null,
+      raw: data,
+    };
   };
+
+  // M3: один повтор при 429 с паузой по Retry-After (по умолчанию 1 с).
+  try {
+    return await build();
+  } catch (err) {
+    if (err?.kind !== "rate_limited") throw err;
+    const wait = err.retryAfter != null ? Math.min(err.retryAfter * 1000, 15_000) : 1000;
+    console.log(`[portal] 429, retrying ${pathname} after ${wait}ms`);
+    await sleep(wait);
+    return await build();
+  }
 }
 
 const HTTP_BY_KIND = {
@@ -137,7 +159,8 @@ const HTTP_BY_KIND = {
   timeout: 504,
   unreachable: 504,
   rate_limited: 429,
-  denied: 403,
+  denied: 401,
+  forbidden: 403,
   portal_error: 502,
 };
 const TEXT_BY_KIND = {
@@ -146,15 +169,35 @@ const TEXT_BY_KIND = {
     "Портал отвечает дольше обычного, данные ещё не готовы. Он под нагрузкой — попробуйте через несколько минут.",
   unreachable: "Не удалось связаться с порталом. Похоже на временный сбой сети.",
   rate_limited: "Слишком много запросов к порталу. Данные обновятся через несколько минут.",
-  denied: "Ключ доступа отклонён порталом. Переподключите Битрикс24 в приложении.",
+  denied: "Сессия или ключ доступа отклонены порталом. Переподключите Битрикс24.",
+  forbidden:
+    "Недостаточно прав на чтение сделок CRM. Убедитесь, что у приложения запрошены скопы CRM.",
   portal_error: "Портал вернул ошибку при запросе данных.",
 };
 
-// ---- фоновый снапшот ------------------------------------------------------
-// Посетитель всегда обслуживается из памяти. Портал опрашивается по таймеру,
-// а не внутри запроса. Старые данные переживают ошибку обновления.
-const SNAPSHOT_PERIODS = ["today", "yesterday", "week", "month"];
-const snapshot = { data: null, at: 0, error: null, building: false };
+// ---- кэш данных на пользователя -------------------------------------------
+// Каждый вошедший пользователь (X-Vibe-User-Id) получает собственный снимок
+// и собственную портальную сессию. Локально (без заголовков шлюза) ключ кэша
+// — "local", а портал вызывается только ключом приложения.
+const userCache = new Map(); // key -> { data, at, error, building }
+
+function cacheKey(req) {
+  const id = req.headers["x-vibe-user-id"];
+  return id && /^\d+$/.test(String(id)) ? `user:${id}` : "local";
+}
+
+function sessionFrom(req) {
+  return req.headers["x-vibe-authorization"] || null;
+}
+
+function getOrCreate(key) {
+  let entry = userCache.get(key);
+  if (!entry) {
+    entry = { data: null, at: 0, error: null, building: false };
+    userCache.set(key, entry);
+  }
+  return entry;
+}
 
 function normalizeDateFields(deal) {
   const out = { ...deal };
@@ -166,130 +209,231 @@ function normalizeDateFields(deal) {
   return out;
 }
 
-// Забираем все страницы сделок (до 5 000 за запрос; прокси сам дочитывает 50-страницы).
-async function fetchAllDeals() {
-  const all = [];
-  const limit = 5000;
-  let offset = 0;
-  for (let i = 0; i < 20; i += 1) {
-    const { value, meta } = await portal("/deals/search", {
-      method: "POST",
-      body: {
-        filter: {},
-        sort: { id: "asc" },
-        limit,
-        offset,
-      },
-    });
-    all.push(...value.map(normalizeDateFields));
-    const hasMore = meta?.hasMore ?? false;
-    offset += limit;
-    if (!hasMore || value.length === 0) break;
-  }
-  return all;
-}
-
-async function fetchStageDictionaries() {
+// ---- словари (стадии, пользователи) ----------------------------------------
+async function fetchStageDictionaries(session) {
   const { value: categories } = await portal("/deal-categories", {
     params: { limit: 100 },
+    session,
   });
-  const dicts = [];
-  const defaultDict = { categoryId: 0, entityId: "DEAL_STAGE" };
   const ids = new Set([0]);
   for (const cat of categories || []) {
-    if (cat?.id != null) {
-      ids.add(cat.id);
+    if (cat?.id != null) ids.add(cat.id);
+  }
+  const dicts = [];
+  for (const id of ids) {
+    dicts.push(id === 0 ? { categoryId: 0, entityId: "DEAL_STAGE" } : { categoryId: id, entityId: `DEAL_STAGE_${id}` });
+  }
+  const stages = [];
+  let stageError = null;
+  for (const dict of dicts) {
+    try {
+      const { value } = await portal("/statuses/search", {
+        method: "POST",
+        body: { filter: { entityId: dict.entityId }, sort: { sort: "asc" }, limit: 200 },
+        session,
+      });
+      stages.push(...value.map((s) => ({ ...s, categoryId: dict.categoryId })));
+    } catch (err) {
+      // M1: не проглатываем отказ словаря — запоминаем и покажем пользователю.
+      stageError = stageError || err.kind || "portal_error";
+      console.log(`[fetch] stages ${dict.entityId} failed: ${err.kind} — ${err.message}`);
     }
   }
-  for (const id of ids) {
-    const entityId = id === 0 ? "DEAL_STAGE" : `DEAL_STAGE_${id}`;
-    dicts.push({ categoryId: id, entityId });
-  }
-  return { categories: categories || [], dictionaries: dicts };
+  return { categories: categories || [], stages, stageError };
 }
 
-async function fetchUserNames(ids) {
+async function fetchUserNames(ids, session) {
   const distinct = [...new Set(ids.filter((v) => v != null && v !== ""))];
   const users = [];
   for (let i = 0; i < distinct.length; i += 50) {
     const chunk = distinct.slice(i, i + 50);
-    const { value } = await portal("/users/search", {
-      method: "POST",
-      body: { filter: { id: { $in: chunk } }, limit: 50 },
-    });
-    users.push(...value);
+    let ok = false;
+    try {
+      const { value } = await portal("/users/search", {
+        method: "POST",
+        body: { filter: { id: { $in: chunk } }, limit: 50 },
+        session,
+      });
+      users.push(...value);
+      ok = true;
+    } catch (err) {
+      console.log("[fetch] users.search failed: " + err.kind);
+    }
+    if (!ok) break;
   }
   return users;
 }
 
-async function refresh() {
-  if (snapshot.building) return;
-  snapshot.building = true;
-  try {
-    const deals = await fetchAllDeals();
-    const stageDefs = await fetchStageDictionaries();
-    const stages = [];
-    for (const dict of stageDefs.dictionaries) {
-      try {
-        const { value } = await portal("/statuses/search", {
-          method: "POST",
-          body: { filter: { entityId: dict.entityId }, sort: { sort: "asc" }, limit: 200 },
-        });
-        stages.push(...value.map((s) => ({ ...s, categoryId: dict.categoryId })));
-      } catch (err) {
-        console.log(`[snapshot] stages ${dict.entityId} failed: ${err.kind} — ${err.message}`);
-      }
-    }
-    const responsibleIds = deals
-      .map((d) => d.responsibleId ?? d.assignedById)
-      .filter((v) => v != null);
-    const users = await fetchUserNames(responsibleIds);
+// ---- агрегация --------------------------------------------------------------
+// KPI и воронка считаются сервером портала через /deals/aggregate с фильтром
+// по дате создания за период. Последние сделки — отдельным search с limit.
+function normalizeGroup(funnelGroup, stageIndex) {
+  const stageId = funnelGroup?.stageId ?? funnelGroup?.id ?? "";
+  const meta = stageIndex.byCode.get(stageId);
+  return {
+    stageId,
+    name: meta?.name || stageId || "Без стадии",
+    count: Number(funnelGroup?.count ?? 0),
+    sum: Number(funnelGroup?.sum ?? funnelGroup?.amount ?? 0),
+    color: meta?.color || null,
+    entityId: meta?.entityId || "DEAL_STAGE",
+  };
+}
 
-    snapshot.data = {
-      deals,
-      stages,
-      users,
+function distinctWon(groups, stageIndex) {
+  return groups
+    .filter((g) => stageIndex.wonIds.has(g.stageId))
+    .map((g) => g.stageId);
+}
+
+async function aggregatePeriod({ session, from, to, stageIndex }) {
+  const filter = { createdAt: { $gte: from, $lte: to } };
+  const body = {
+    filter,
+    aggregate: [
+      { field: "amount", function: "sum" },
+      { field: "id", function: "count" },
+    ],
+    groupBy: "stageId",
+  };
+  return portal("/deals/aggregate", { method: "POST", body, session });
+}
+
+async function recentDeals({ session, from, to }) {
+  const { value } = await portal("/deals/search", {
+    method: "POST",
+    body: {
+      filter: { createdAt: { $gte: from, $lte: to } },
+      sort: { createdAt: "desc" },
+      limit: 20,
+      select: ["id", "title", "stageId", "amount", "responsibleId", "createdAt"],
+    },
+    session,
+  });
+  return value.map(normalizeDateFields);
+}
+
+async function buildSnapshotForKey(key, session) {
+  const entry = getOrCreate(key);
+  if (entry.building) return;
+  entry.building = true;
+  try {
+    const stageDefs = await fetchStageDictionaries(session);
+    const recent = await recentDeals({ session, from: "2000-01-01T00:00:00.000Z", to: "9999-12-31T23:59:59.999Z" });
+    const responsibleIds = recent.map((d) => d.responsibleId ?? d.assignedById);
+    const users = await fetchUserNames(responsibleIds, session);
+    entry.data = {
+      stages: stageDefs.stages,
       categories: stageDefs.categories,
+      stageError: stageDefs.stageError,
+      users,
       domain: DOMAIN,
       fetchedAt: new Date().toISOString(),
     };
-    snapshot.at = Date.now();
-    snapshot.error = null;
+    entry.at = Date.now();
+    entry.error = null;
   } catch (err) {
-    snapshot.error = { kind: err.kind || "portal_error", message: err.message };
-    console.log(`[snapshot] refresh failed: ${snapshot.error.kind} — ${err.message}`);
+    entry.error = { kind: err.kind || "portal_error", message: err.message };
+    console.log(`[refresh] ${key} failed: ${entry.error.kind} — ${err.message}`);
   } finally {
-    snapshot.building = false;
+    entry.building = false;
   }
 }
 
-function buildDashboard(period, from, to) {
-  const stageIndex = buildStageIndex(snapshot.data.stages);
-  const usersIndex = buildUsersIndex(snapshot.data.users);
+async function refresh() {
+  const keys = userCache.size ? [...userCache.keys()] : ["local"];
+  for (const key of keys) {
+    const entry = userCache.get(key) || getOrCreate(key);
+    // Локальному/сервисному кэшу сессии не нужно; для user-кэша храним сессию
+    // отдельно от обычного ответа.
+    if (entry.building) continue;
+    const sessionKnown = key === "local" ? null : entry.session ?? null;
+    await buildSnapshotForKey(key, sessionKnown);
+    await sleep(50);
+  }
+}
+
+async function dashboardFor({ key, session, period, from, to }) {
+  const entry = getOrCreate(key);
+  if (session) entry.session = session; // для фоновых обновлений
+  const stageIndex = buildStageIndex(entry.data?.stages);
+  const usersIndex = buildUsersIndex(entry.data?.users);
   const range = resolvePeriod(period, from, to);
   if (!range) {
     return {
       ok: false,
-      error:
-        "Некорректный период: укажите «произвольный период» с датой «от» не позже «до».",
-      periods: SNAPSHOT_PERIODS,
+      error: "Некорректный период: укажите «произвольный период» с датой «от» не позже «до».",
+      periods: ["today", "yesterday", "week", "month", "custom"],
     };
   }
-  const periodDeals = filterByPeriod(snapshot.data.deals, range.from, range.to);
-  const kpi = computeKpi(periodDeals, stageIndex);
-  const funnel = computeFunnel(periodDeals, stageIndex);
-  const recent = computeRecent(periodDeals, stageIndex, usersIndex, 20);
+  const iso = isoRange(range);
+  const agg = await aggregatePeriod({
+    session,
+    from: iso.from,
+    to: iso.to,
+    stageIndex,
+  });
+  const rawGroups = Array.isArray(agg.value) ? agg.value : (agg.raw?.groups ?? []);
+  const groups = rawGroups.map((g) => normalizeGroup(g, stageIndex)).filter((g) => g.stageId);
+  const wonIds = distinctWon(groups, stageIndex);
+  const wonGroups = groups.filter((g) => wonIds.includes(g.stageId));
+  const openGroups = groups.filter((g) => !wonIds.includes(g.stageId));
+  const wonCount = wonGroups.reduce((s, g) => s + g.count, 0);
+  const wonSum = wonGroups.reduce((s, g) => s + g.sum, 0);
+  const openSum = openGroups.reduce((s, g) => s + g.sum, 0);
+
+  const recentRes = await recentDeals({ session, from: iso.from, to: iso.to });
+  const recent = recentRes.map((d) => {
+    const stageId = d.stageId ?? "";
+    const meta = stageIndex.byCode.get(stageId);
+    const respId = d.responsibleId ?? d.assignedById;
+    const user = usersIndex.get(String(respId));
+    return {
+      id: d.id,
+      title: d.title ?? "Без названия",
+      amount: Number(d.amount ?? 0) || 0,
+      stageId,
+      stageName: meta?.name || stageId || "Без стадии",
+      responsibleName: user ? [user.lastName, user.name].filter(Boolean).join(" ") || user.email || "—" : "—",
+      createdAt: d.createdAt ? new Date(d.createdAt).toISOString() : null,
+    };
+  });
+
+  const metaAgg = agg.raw?.meta ?? agg.meta ?? {};
+  const warnings = [];
+  if (entry.data?.stageError) {
+    warnings.push("Не удалось загрузить словарь стадий — показываю коды вместо названий; выигранные определяются на доверии коду WON.");
+  }
+  // M2/AGGR: обе ветки потолка агрегации.
+  if (metaAgg.truncated === true) {
+    warnings.push("Слишком широкий период: агрегация портала обрезана (потолок 5000) — цифры могут быть неполными.");
+  }
+  if (agg.raw?.error?.code === "AGGREGATION_LIMIT_EXCEEDED" || metaAgg?.aggregationLimitExceeded) {
+    warnings.push("Агрегация превысила лимит портала (AGGREGATION_LIMIT_EXCEEDED) — сузьте период.");
+  }
+
   return {
     ok: true,
-    period: { key: range.key, ...isoRange(range) },
-    kpi,
-    funnel,
+    period: { key: range.key, ...iso },
+    kpi: {
+      openSum,
+      wonCount,
+      wonSum,
+      avgCheck: wonCount > 0 ? wonSum / wonCount : 0,
+    },
+    funnel: openGroups.concat(wonGroups),
     recent,
     totals: {
-      found: periodDeals.length,
-      snapshot: snapshot.data.deals.length,
+      found: groups.reduce((s, g) => s + g.count, 0),
+      groups: groups.length,
     },
+    warnings,
   };
+}
+
+function writeJson(res, status, obj) {
+  res.writeHead(status, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+  res.end(JSON.stringify(obj));
 }
 
 const server = http.createServer(async (req, res) => {
@@ -301,74 +445,80 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  const key = cacheKey(req);
+  const session = sessionFrom(req);
+
   // --- /api/dashboard ------------------------------------------------------
   if (url.pathname === "/api/dashboard") {
+    const entry = getOrCreate(key);
     const period = url.searchParams.get("period") || "month";
-    const from = url.searchParams.get("from") || null;
-    const to = url.searchParams.get("to") || null;
+    const from = url.searchParams.get("from");
+    const to = url.searchParams.get("to");
     const meta = {
-      updatedAt: snapshot.at ? new Date(snapshot.at).toISOString() : null,
-      ageMs: snapshot.at ? Date.now() - snapshot.at : null,
-      building: snapshot.building,
-      warning: snapshot.error ? TEXT_BY_KIND[snapshot.error.kind] : null,
+      updatedAt: entry.at ? new Date(entry.at).toISOString() : null,
+      ageMs: entry.at ? Date.now() - entry.at : null,
+      building: entry.building,
     };
-    if (!snapshot.data) {
-      const kind = snapshot.error?.kind ?? (KEY && BASE ? "loading" : "no_key");
+
+    if (!entry.data) {
+      // Первое обращение пользователя — соберём словари.
+      if (!entry.building) {
+        entry.session = session;
+        void buildSnapshotForKey(key, session);
+      }
+      const kind = entry.error?.kind ?? (KEY && BASE ? "loading" : "no_key");
       if (kind === "loading") {
-        res.writeHead(202, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({
-            error: "Данные ещё загружаются. Портал отвечает медленно, подождите.",
-            meta,
-          }),
-        );
+        writeJson(res, 202, {
+          error: "Данные ещё загружаются. Портал отвечает медленно, подождите.",
+          meta,
+        });
         return;
       }
-      res.writeHead(HTTP_BY_KIND[kind] || 500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: TEXT_BY_KIND[kind], kind, meta }));
+      writeJson(res, HTTP_BY_KIND[kind] || 500, { error: TEXT_BY_KIND[kind], kind, meta });
       return;
     }
-    const result = buildDashboard(period, from, to);
-    res.writeHead(200, {
-      "Content-Type": "application/json",
-      "Cache-Control": "no-store",
-    });
-    res.end(JSON.stringify({ ...result, meta }));
+
+    // Данные есть: считаем дашборд на лету (агрегатами), словари из кэша.
+    try {
+      const result = await dashboardFor({ key, session, period, from, to });
+      const warning = entry.error
+        ? TEXT_BY_KIND[entry.error.kind]
+        : result.warnings?.join(" ") || null;
+      writeJson(res, 200, { ...result, meta: { ...meta, warning } });
+    } catch (err) {
+      const kind = err.kind || "portal_error";
+      writeJson(res, HTTP_BY_KIND[kind] || 502, {
+        error: TEXT_BY_KIND[kind] || "Портал вернул ошибку при запросе данных.",
+        kind,
+        meta,
+      });
+    }
     return;
   }
 
   // --- /api/health ---------------------------------------------------------
+  // M7: только факт наличия ключа, без путей и текстов ошибок.
   if (url.pathname === "/api/health") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify({
-        keyPresent: Boolean(KEY),
-        keySource: KEY ? (KEY_FROM_ENVIRONMENT ? "environment" : ENV_FILE) : null,
-        baseUrlPresent: Boolean(BASE),
-        portalTimeoutMs: PORTAL_TIMEOUT_MS,
-        snapshot: {
-          updatedAt: snapshot.at ? new Date(snapshot.at).toISOString() : null,
-          building: snapshot.building,
-          lastError: snapshot.error,
-          deals: snapshot.data?.deals?.length ?? null,
-          stages: snapshot.data?.stages?.length ?? null,
-          users: snapshot.data?.users?.length ?? null,
-        },
-      }),
-    );
+    writeJson(res, 200, {
+      status: "ok",
+      keyPresent: Boolean(KEY),
+      baseUrlPresent: Boolean(BASE),
+      portalTimeoutMs: PORTAL_TIMEOUT_MS,
+      snapshot: {
+        updatedAt:
+          userCache.get(key)?.at
+            ? new Date(userCache.get(key).at).toISOString()
+            : null,
+        deals: null, // агрегаты не хранят число строк сделок в кэше
+      },
+    });
     return;
   }
 
   // --- /api/meta: служебные данные для фронта (домен для ссылок) ----------
   if (url.pathname === "/api/meta") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify({
-        domain: DOMAIN,
-        snapshotDeals: snapshot.data?.deals?.length ?? null,
-      }),
-    );
-    return;
+    const entry = getOrCreate(key);
+    writeJson(res, 200, { domain: DOMAIN });
   }
 
   // --- статика только из public/ -----------------------------------------
@@ -402,4 +552,4 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => console.log(`listening on ${PORT}`));
 void refresh();
-setInterval(() => void refresh(), REFRESH_MS).unref();
+setInterval(() => void refresh(), CACHE_MS).unref();

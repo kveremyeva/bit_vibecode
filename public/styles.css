@@ -13,8 +13,8 @@
   --amber: #f5b84e;
   --rose: #ff6b6b;
   --blue: #6fb7ff;
-  --serif: "Manrope", "Segoe UI", sans-serif;
-  --mono: "IBM Plex Mono", "Consolas", monospace;
+  --serif: "Segoe UI", system-ui, -apple-system, Roboto, sans-serif;
+  --mono: "Cascadia Code", "Consolas", ui-monospace, monospace;
   --radius: 14px;
   --shadow: 0 18px 44px -22px rgba(0, 0, 0, 0.75);
 }

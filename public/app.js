@@ -95,6 +95,44 @@ function defaultRange() {
   return { from: fmt(start), to: fmt(end) };
 }
 
+// M5: границы периода считаем в таймзоне браузера пользователя (та же, что
+// у портала для этого пользователя), а не в UTC сервера. Возвращает ISO
+// с явным смещением, чтобы сервер агрегировал ровно локальные «сегодня» и
+// «вчера», а не по UTC.
+function localISO(date) {
+  return date.toISOString();
+}
+
+function rangeForPeriod(period, from, to) {
+  const now = new Date();
+  if (period === "custom") {
+    if (!from || !to) return null;
+    const f = new Date(`${from}T00:00:00`);
+    // M4: конец «до» — последняя миллисекунда локального дня, а не полночь.
+    const t = new Date(`${to}T23:59:59.999`);
+    if (Number.isNaN(f.getTime()) || Number.isNaN(t.getTime()) || f > t) return null;
+    return { from: localISO(f), to: localISO(t) };
+  }
+  const startOf = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  let fromDate;
+  if (period === "today") {
+    fromDate = startOf(now);
+  } else if (period === "yesterday") {
+    fromDate = new Date(startOf(now).getTime() - 86_400_000);
+  } else if (period === "week") {
+    const dow = now.getDay(); // 0 = вс
+    const offset = (dow + 6) % 7; // пн = 0
+    fromDate = new Date(startOf(now).getTime() - offset * 86_400_000);
+  } else if (period === "month") {
+    fromDate = new Date(now.getFullYear(), now.getMonth(), 1);
+  } else {
+    return null;
+  }
+  // «до» — конец сегодняшнего дня по местному времени.
+  const toDate = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
+  return { from: localISO(fromDate), to: localISO(toDate), fromDate, toDate };
+}
+
 // ---------- состояние статуса ----------
 function setStatus(text, s = "wait") {
   els.statusText.textContent = text;
@@ -104,10 +142,11 @@ function setStatus(text, s = "wait") {
 // ---------- загрузка данных ----------
 async function load() {
   els.refreshBtn.classList.add("is-spinning");
+  const range = rangeForPeriod(state.period, state.from, state.to);
   const params = new URLSearchParams({ period: state.period });
-  if (state.period === "custom") {
-    if (state.from) params.set("from", state.from);
-    if (state.to) params.set("to", state.to);
+  if (range) {
+    params.set("from", range.from);
+    params.set("to", range.to);
   }
   setStatus("Загружаю данные портала…", "wait");
 
@@ -117,6 +156,10 @@ async function load() {
 
     if (res.status === 202) {
       setStatus(json?.error || "Портал ещё отвечает…", "wait");
+      // Портал медленный: повторяем запрос через пару секунд, а не навсегда.
+      window.setTimeout(() => {
+        if (!document.hidden) load();
+      }, 3000);
       return;
     }
     if (!res.ok) {
@@ -130,15 +173,30 @@ async function load() {
 
     state.meta = json.meta;
     render(json);
-    if (json.meta?.warning) {
+    if (json.warnings && json.warnings.length) {
+      setStatus(`${json.warnings.join(" ")} Данные от ${fmtAgo(json.meta?.ageMs)}.`, "wait");
+    } else if (json.meta?.warning) {
       setStatus(`${json.meta.warning} Данные от ${fmtAgo(json.meta.ageMs)}.`, "wait");
     } else {
-      setStatus("Данные актуальны", "ok");
+      const tz = getTzLabel();
+      setStatus(`Данные актуальны · периоды по местному времени (${tz})`, "ok");
     }
   } catch {
     setStatus("Не удалось получить данные. Проверьте соединение.", "err");
   } finally {
     els.refreshBtn.classList.remove("is-spinning");
+  }
+}
+
+function getTzLabel() {
+  try {
+    const offsetMin = -new Date().getTimezoneOffset();
+    const sign = offsetMin >= 0 ? "+" : "-";
+    const hh = String(Math.floor(Math.abs(offsetMin) / 60)).padStart(2, "0");
+    const mm = String(Math.abs(offsetMin) % 60).padStart(2, "0");
+    return `UTC${sign}${hh}:${mm}`;
+  } catch {
+    return "local";
   }
 }
 
@@ -217,7 +275,7 @@ function renderRecent(recent, totals) {
     return;
   }
   const domain = window.__PORTAL_DOMAIN__ || "";
-  els.recentHint.textContent = `Показано ${recent.length} · всего в снимке ${fmtInt(totals?.snapshot ?? 0)} · новые сверху`;
+  els.recentHint.textContent = `Показано ${recent.length} последних · по ${fmtInt(totals?.found ?? 0)} сделкам за период · новые сверху`;
   els.recentBody.innerHTML = recent
     .map((deal) => {
       const link = domain && deal.id != null
@@ -256,11 +314,11 @@ function renderFoot(json) {
     ? `Снимок данных: ${new Date(json.meta.updatedAt).toLocaleString("ru-RU")} (${fmtAgo(json.meta.ageMs)})`
     : "";
   const discovered = json.totals ? `· найдено за период: ${fmtInt(json.totals.found)}` : "";
-  const snapshot = json.totals ? `всего в снимке: ${fmtInt(json.totals.snapshot)}` : "";
+  const groups = json.totals ? `· групп по стадиям: ${fmtInt(json.totals.groups)}` : "";
   els.foot.innerHTML = `
     <span class="updated">${escapeHtml(upd)}</span>
     <span>${escapeHtml(discovered)}</span>
-    <span>${escapeHtml(snapshot)}</span>
+    <span>${escapeHtml(groups)}</span>
   `;
 }
 
