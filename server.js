@@ -583,6 +583,43 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // --- /api/debug/all: диагностика всех вызовов дашборда (временный) -------
+  if (url.pathname === "/api/debug/all") {
+    const from = url.searchParams.get("from") || "2026-08-01T00:00:00.000Z";
+    const to = url.searchParams.get("to") || "2026-09-30T23:59:59.999Z";
+    const out = {};
+
+    out.aggregate = await portalRaw("/deals/aggregate", {
+      method: "POST",
+      body: {
+        filter: { createdAt: { $gte: from, $lte: to } },
+        aggregate: [{ field: "amount", function: "sum" }],
+        groupBy: "stageId",
+      },
+      session,
+    });
+
+    out.recent = await portalRaw("/deals/search", {
+      method: "POST",
+      body: {
+        filter: { createdAt: { $gte: from, $lte: to } },
+        sort: { createdAt: "desc" },
+        limit: 20,
+        select: ["id", "title", "stageId", "amount", "responsibleId", "createdAt"],
+      },
+      session,
+    });
+
+    out.users = await portalRaw("/users/search", {
+      method: "POST",
+      body: { filter: { id: { $in: [1] } }, limit: 5 },
+      session,
+    });
+
+    writeJson(res, 200, out);
+    return;
+  }
+
   // --- статика только из public/ -----------------------------------------
   const rel = url.pathname === "/" ? "index.html" : url.pathname.slice(1);
   const isDotfile = rel.split("/").some((seg) => seg.startsWith("."));
