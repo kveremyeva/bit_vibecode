@@ -342,7 +342,7 @@ async function recentDeals({ session, from, to }) {
       filter: { createdAt: { $gte: from, $lte: to } },
       sort: { createdAt: "desc" },
       limit: 20,
-      select: ["id", "title", "stageId", "amount", "responsibleId", "createdAt"],
+      select: ["id", "title", "stageId", "amount", "assignedById", "createdAt"],
     },
     session,
   });
@@ -412,14 +412,14 @@ async function dashboardFor({ key, session, period, from, to }) {
 
   const recentRes = await recentDeals({ session, from: iso.from, to: iso.to });
   const respIds = recentRes
-    .map((d) => d.responsibleId ?? d.assignedById)
+    .map((d) => d.assignedById ?? d.responsibleId)
     .filter((v) => v != null);
   const respUsers = await fetchUserNames(respIds);
   const usersIndex = buildUsersIndex(respUsers);
   const recent = recentRes.map((d) => {
     const stageId = d.stageId ?? "";
     const meta = stageIndex.byCode.get(stageId);
-    const respId = d.responsibleId ?? d.assignedById;
+    const respId = d.assignedById ?? d.responsibleId;
     const user = usersIndex.get(String(respId));
     return {
       id: d.id,
@@ -605,7 +605,7 @@ const server = http.createServer(async (req, res) => {
         filter: { createdAt: { $gte: from, $lte: to } },
         sort: { createdAt: "desc" },
         limit: 20,
-        select: ["id", "title", "stageId", "amount", "responsibleId", "createdAt"],
+        select: ["id", "title", "stageId", "amount", "assignedById", "createdAt"],
       },
       session,
     });
