@@ -308,7 +308,12 @@ function normalizeGroup(funnelGroup, stageIndex) {
     stageId,
     name: meta?.name || stageId || "Без стадии",
     count: Number(funnelGroup?.count ?? 0),
-    sum: Number(funnelGroup?.sum ?? funnelGroup?.amount ?? 0),
+    sum: Number(
+      funnelGroup?.aggregates?.amount?.sum ??
+        funnelGroup?.sum ??
+        funnelGroup?.amount ??
+        0,
+    ),
     color: meta?.color || null,
     entityId: meta?.entityId || "DEAL_STAGE",
   };
@@ -395,7 +400,8 @@ async function dashboardFor({ key, session, period, from, to }) {
     to: iso.to,
     stageIndex,
   });
-  const rawGroups = Array.isArray(agg.value) ? agg.value : (agg.raw?.groups ?? []);
+  const aggData = agg.raw?.data ?? agg.raw ?? {};
+  const rawGroups = Array.isArray(aggData?.groups) ? aggData.groups : [];
   const groups = rawGroups.map((g) => normalizeGroup(g, stageIndex)).filter((g) => g.stageId);
   const wonIds = distinctWon(groups, stageIndex);
   const wonGroups = groups.filter((g) => wonIds.includes(g.stageId));
@@ -426,16 +432,19 @@ async function dashboardFor({ key, session, period, from, to }) {
     };
   });
 
-  const metaAgg = agg.raw?.meta ?? agg.meta ?? {};
+  const metaAgg = aggData?.meta ?? agg.meta ?? {};
   const warnings = [];
   if (entry.data?.stageError) {
     warnings.push("Не удалось загрузить словарь стадий — показываю коды вместо названий; выигранные определяются на доверии коду WON.");
   }
   // M2/AGGR: обе ветки потолка агрегации.
-  if (metaAgg.truncated === true) {
+  if (metaAgg.truncated === true || metaAgg.groupsTruncated === true) {
     warnings.push("Слишком широкий период: агрегация портала обрезана (потолок 5000) — цифры могут быть неполными.");
   }
-  if (agg.raw?.error?.code === "AGGREGATION_LIMIT_EXCEEDED" || metaAgg?.aggregationLimitExceeded) {
+  if (
+    agg.raw?.error?.code === "AGGREGATION_LIMIT_EXCEEDED" ||
+    metaAgg?.aggregationLimitExceeded
+  ) {
     warnings.push("Агрегация превысила лимит портала (AGGREGATION_LIMIT_EXCEEDED) — сузьте период.");
   }
 
