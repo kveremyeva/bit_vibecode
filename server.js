@@ -126,11 +126,15 @@ async function portal(pathname, { method = "GET", body, params, session } = {}) 
           : res.status === 403
             ? "forbidden"
             : "portal_error";
-      throw new PortalError(
+      const pe = new PortalError(
         kind,
         data?.error?.message || `portal_error_${res.status}`,
         res.status,
       );
+      // C2: сохраняем код ошибки портала (например AGGREGATION_LIMIT_EXCEEDED),
+      // чтобы обработчик мог отличить его от обычного сбоя.
+      pe.code = data?.error?.code || null;
+      throw pe;
     }
 
     console.log(`[portal] ${pathname} -> ${res.status} in ${Date.now() - startedAt}ms`);
@@ -366,12 +370,33 @@ async function dashboardFor({ key, session, period, from, to }) {
     };
   }
   const iso = isoRange(range);
-  const agg = await aggregatePeriod({
-    session,
-    from: iso.from,
-    to: iso.to,
-    stageIndex,
-  });
+  const warnings = [];
+  let agg;
+  try {
+    agg = await aggregatePeriod({
+      session,
+      from: iso.from,
+      to: iso.to,
+      stageIndex,
+    });
+  } catch (err) {
+    // C2: 422 AGGREGATION_LIMIT_EXCEEDED приходит исключением (portal()
+    // бросает PortalError до формирования raw), ловим по коду/статусу.
+    if (err.code === "AGGREGATION_LIMIT_EXCEEDED" || err.status === 422) {
+      return {
+        ok: true,
+        period: { key: range.key, ...iso },
+        kpi: { openSum: 0, wonCount: 0, wonSum: 0, avgCheck: 0 },
+        funnel: [],
+        recent: [],
+        totals: { found: 0, groups: 0 },
+        warnings: [
+          "Агрегация превысила лимит портала (AGGREGATION_LIMIT_EXCEEDED) — сузьте период.",
+        ],
+      };
+    }
+    throw err;
+  }
   const aggData = agg.raw?.data ?? agg.raw ?? {};
   const rawGroups = Array.isArray(aggData?.groups) ? aggData.groups : [];
   const groups = rawGroups.map((g) => normalizeGroup(g, stageIndex)).filter((g) => g.stageId);
@@ -405,19 +430,12 @@ async function dashboardFor({ key, session, period, from, to }) {
   });
 
   const metaAgg = aggData?.meta ?? agg.meta ?? {};
-  const warnings = [];
   if (entry.data?.stageError) {
     warnings.push("Не удалось загрузить словарь стадий — показываю коды вместо названий; выигранные определяются на доверии коду WON.");
   }
-  // M2/AGGR: обе ветки потолка агрегации.
+  // M2/AGGR: вторая ветка потолка агрегации — truncation по строкам/группам.
   if (metaAgg.truncated === true || metaAgg.groupsTruncated === true) {
     warnings.push("Слишком широкий период: агрегация портала обрезана (потолок 5000) — цифры могут быть неполными.");
-  }
-  if (
-    agg.raw?.error?.code === "AGGREGATION_LIMIT_EXCEEDED" ||
-    metaAgg?.aggregationLimitExceeded
-  ) {
-    warnings.push("Агрегация превысила лимит портала (AGGREGATION_LIMIT_EXCEEDED) — сузьте период.");
   }
 
   return {
