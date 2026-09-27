@@ -63,10 +63,11 @@ class PortalError extends Error {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Запрос к порталу. Аутентификация: основная — сессия шлюза
-// X-Vibe-Authorization (Bearer vibe_session_…), которую шлюз проставляет в
-// каждый запрос к приложению; ключ приложения X-Api-Key добавляется как
-// дополнительный заголовок, когда он есть. Нужен лишь базовый адрес прокси.
+// Запрос к порталу. Аутентификация — ключ приложения (X-Api-Key) + сессия
+// шлюза (X-Vibe-Authorization, Bearer vibe_session_…), которую шлюз проставляет
+// в каждый запрос к приложению. Оба заголовка передаются вместе: ключ
+// обеспечивает доступ к данным портала, сессия — работу от лица вошедшего
+// пользователя. Нужен лишь базовый адрес прокси.
 async function portal(pathname, { method = "GET", body, params, session } = {}) {
   if (!BASE) throw new PortalError("no_key", "proxy base url is absent");
   const build = async () => {
