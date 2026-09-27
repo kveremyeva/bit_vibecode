@@ -47,15 +47,9 @@ const CACHE_MS = Number(process.env.CACHE_MS || 5 * 60_000);
 const AGG_LIMIT = 5000;
 
 console.log(
-  KEY
-    ? `portal key loaded from ${
-        KEY_FROM_ENVIRONMENT ? "the environment" : ENV_FILE
-      }`
-    : `NO portal key: ${
-        ENV_FILE
-          ? `${ENV_FILE} has no BITRIX_API_KEY`
-          : "no .env found and none in the environment"
-      } — /api/* will report the missing key until it appears`,
+  `auth: ${KEY ? "app key from " + (KEY_FROM_ENVIRONMENT ? "env" : ENV_FILE) : "session of the signed-in user"} · proxy: ${
+    BASE ? "configured" : "MISSING"
+  }`,
 );
 
 class PortalError extends Error {
@@ -69,11 +63,12 @@ class PortalError extends Error {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Запрос к порталу. Дополнительный заголовок X-Vibe-Authorization (сессия
-// шлюза) пробрасывается вместе с ключом приложения: тогда портал отдаёт
-// данные именно того пользователя, который открыл приложение.
+// Запрос к порталу. Аутентификация: основная — сессия шлюза
+// X-Vibe-Authorization (Bearer vibe_session_…), которую шлюз проставляет в
+// каждый запрос к приложению; ключ приложения X-Api-Key добавляется как
+// дополнительный заголовок, когда он есть. Нужен лишь базовый адрес прокси.
 async function portal(pathname, { method = "GET", body, params, session } = {}) {
-  if (!KEY || !BASE) throw new PortalError("no_key", "portal env vars are absent");
+  if (!BASE) throw new PortalError("no_key", "proxy base url is absent");
   const build = async () => {
     const url = new URL(`${BASE}${pathname}`);
     if (params) {
@@ -88,10 +83,10 @@ async function portal(pathname, { method = "GET", body, params, session } = {}) 
       res = await fetch(url, {
         method,
         headers: {
-          "X-Api-Key": KEY,
           Accept: "application/json",
-          ...(body ? { "Content-Type": "application/json" } : {}),
           ...(session ? { "X-Vibe-Authorization": session } : {}),
+          ...(KEY ? { "X-Api-Key": KEY } : {}),
+          ...(body ? { "Content-Type": "application/json" } : {}),
         },
         ...(body ? { body: JSON.stringify(body) } : {}),
         signal: ctl.signal,
@@ -214,14 +209,13 @@ function normalizeDateFields(deal) {
 }
 
 // ---- словари (стадии, воронки, пользователи) -------------------------------
-// Справочники не зависят от конкретного пользователя, поэтому их тянем по
-// ключу приложения (без сессии) и устойчиво: отказ словаря не роняет refresh,
-// а лишь помечается (M1). Сессия пробрасывается только к запросам сделок.
-async function fetchStageDictionaries() {
+// Справочники ходим той же сессией/ключом, что и сделки. Отказ словаря не
+// роняет refresh, а лишь помечается (M1): пользователь видит предупреждение.
+async function fetchStageDictionaries(session) {
   let categories = [];
   let categoriesError = null;
   try {
-    const res = await portal("/deal-categories", { params: { limit: 100 } });
+    const res = await portal("/deal-categories", { params: { limit: 100 }, session });
     categories = res.value || [];
   } catch (err) {
     categoriesError = err.kind || "portal_error";
@@ -242,6 +236,7 @@ async function fetchStageDictionaries() {
       const { value } = await portal("/statuses/search", {
         method: "POST",
         body: { filter: { entityId: dict.entityId }, sort: { sort: "asc" }, limit: 200 },
+        session,
       });
       stages.push(...value.map((s) => ({ ...s, categoryId: dict.categoryId })));
     } catch (err) {
@@ -253,7 +248,7 @@ async function fetchStageDictionaries() {
   return { categories, stages, stageError: stageError || categoriesError };
 }
 
-async function fetchUserNames(ids) {
+async function fetchUserNames(ids, session) {
   const distinct = [...new Set(ids.filter((v) => v != null && v !== ""))];
   const users = [];
   for (let i = 0; i < distinct.length; i += 50) {
@@ -263,6 +258,7 @@ async function fetchUserNames(ids) {
       const { value } = await portal("/users/search", {
         method: "POST",
         body: { filter: { id: { $in: chunk } }, limit: 50 },
+        session,
       });
       users.push(...value);
       ok = true;
@@ -325,12 +321,12 @@ async function recentDeals({ session, from, to }) {
   return value.map(normalizeDateFields);
 }
 
-async function buildSnapshotForKey(key) {
+async function buildSnapshotForKey(key, session) {
   const entry = getOrCreate(key);
   if (entry.building) return;
   entry.building = true;
   try {
-    const stageDefs = await fetchStageDictionaries();
+    const stageDefs = await fetchStageDictionaries(session);
     entry.data = {
       stages: stageDefs.stages,
       categories: stageDefs.categories,
@@ -353,13 +349,14 @@ async function refresh() {
   for (const key of keys) {
     const entry = userCache.get(key) || getOrCreate(key);
     if (entry.building) continue;
-    await buildSnapshotForKey(key);
+    await buildSnapshotForKey(key, entry.session ?? null);
     await sleep(50);
   }
 }
 
 async function dashboardFor({ key, session, period, from, to }) {
   const entry = getOrCreate(key);
+  if (session) entry.session = session; // для фоновых обновлений словарей
   const stageIndex = buildStageIndex(entry.data?.stages);
   const range = resolvePeriod(period, from, to);
   if (!range) {
@@ -411,7 +408,7 @@ async function dashboardFor({ key, session, period, from, to }) {
   const respIds = recentRes
     .map((d) => d.assignedById ?? d.responsibleId)
     .filter((v) => v != null);
-  const respUsers = await fetchUserNames(respIds);
+  const respUsers = await fetchUserNames(respIds, session);
   const usersIndex = buildUsersIndex(respUsers);
   const recent = recentRes.map((d) => {
     const stageId = d.stageId ?? "";
@@ -489,9 +486,11 @@ const server = http.createServer(async (req, res) => {
     if (!entry.data) {
       // Первое обращение пользователя — соберём словари.
       if (!entry.building) {
-        void buildSnapshotForKey(key);
+        if (session) entry.session = session;
+        void buildSnapshotForKey(key, session);
       }
-      const kind = entry.error?.kind ?? (KEY && BASE ? "loading" : "no_key");
+      const canAuth = Boolean(session) || Boolean(KEY);
+      const kind = entry.error?.kind ?? (BASE && canAuth ? "loading" : "no_key");
       if (kind === "loading") {
         writeJson(res, 202, {
           error: "Данные ещё загружаются. Портал отвечает медленно, подождите.",
@@ -522,11 +521,13 @@ const server = http.createServer(async (req, res) => {
   }
 
   // --- /api/health ---------------------------------------------------------
-  // M7: только факт наличия ключа, без путей и текстов ошибок.
+  // M7: только факт наличия доступа, без путей и текстов ошибок.
   if (url.pathname === "/api/health") {
     writeJson(res, 200, {
       status: "ok",
       keyPresent: Boolean(KEY),
+      sessionPresent: Boolean(session),
+      authAvailable: Boolean(session) || Boolean(KEY),
       baseUrlPresent: Boolean(BASE),
       portalTimeoutMs: PORTAL_TIMEOUT_MS,
       snapshot: {
