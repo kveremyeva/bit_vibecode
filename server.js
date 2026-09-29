@@ -64,10 +64,10 @@ class PortalError extends Error {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Запрос к порталу. Аутентификация — ключ приложения (X-Api-Key) + сессия
-// шлюза (X-Vibe-Authorization, Bearer vibe_session_…), которую шлюз проставляет
-// в каждый запрос к приложению. Оба заголовка передаются вместе: ключ
-// обеспечивает доступ к данным портала, сессия — работу от лица вошедшего
-// пользователя. Нужен лишь базовый адрес прокси.
+// пользователя. Сессия шлюза из заголовка X-Vibe-Authorization передаётся в
+// /v1/* стандартным заголовком Authorization (Bearer vibe_session_…), чтобы
+// данные отдавались от лица вошедшего пользователя; ключ X-Api-Key идёт вместе
+// с ней и открывает доступ к данным портала.
 async function portal(pathname, { method = "GET", body, params, session } = {}) {
   if (!BASE) throw new PortalError("no_key", "proxy base url is absent");
   const build = async () => {
@@ -85,7 +85,7 @@ async function portal(pathname, { method = "GET", body, params, session } = {}) 
         method,
         headers: {
           Accept: "application/json",
-          ...(session ? { "X-Vibe-Authorization": session } : {}),
+          ...(session ? { "Authorization": session } : {}),
           ...(KEY ? { "X-Api-Key": KEY } : {}),
           ...(body ? { "Content-Type": "application/json" } : {}),
         },
@@ -155,6 +155,7 @@ async function portal(pathname, { method = "GET", body, params, session } = {}) 
 }
 
 const HTTP_BY_KIND = {
+  no_session: 401,
   no_key: 503,
   timeout: 504,
   unreachable: 504,
@@ -164,6 +165,7 @@ const HTTP_BY_KIND = {
   portal_error: 502,
 };
 const TEXT_BY_KIND = {
+  no_session: "Требуется авторизация: сессия пользователя не передана.",
   no_key: "Портал не подключён — приложение запущено без ключа доступа.",
   timeout:
     "Портал отвечает дольше обычного, данные ещё не готовы. Он под нагрузкой — попробуйте через несколько минут.",
@@ -478,6 +480,14 @@ const server = http.createServer(async (req, res) => {
     const period = url.searchParams.get("period") || "month";
     const from = url.searchParams.get("from");
     const to = url.searchParams.get("to");
+
+    // С1: без сессии (и без локального ключа для разработки) — 401 сразу,
+    // без обращения к порталу. Анонимный запрос данных не обслуживается.
+    if (!session && !KEY) {
+      writeJson(res, HTTP_BY_KIND.no_session, { error: TEXT_BY_KIND.no_session, kind: "no_session" });
+      return;
+    }
+
     const meta = {
       updatedAt: entry.at ? new Date(entry.at).toISOString() : null,
       ageMs: entry.at ? Date.now() - entry.at : null,
