@@ -70,14 +70,12 @@
 
 Приложение публикуется за шлюзом платформы и доступно **авторизованным
 пользователям портала** (не только владельцу). Реализован **OAuth-флоу**
-(вариант А, публичный connect-клиент Битрикс24 + PKCE, сессия per-user):
+(вариант А, сессия per-user):
 
-* `/oauth/start` — генерирует `code_verifier`/`code_challenge` (S256) и
-  редиректит на `GET /v1/connect/authorize` (`client_id`, redirect_uri, state,
-  scope, code_challenge, code_challenge_method=S256);
+* `/oauth/start` — редирект на `GET /v1/oauth/authorize` (app_key, redirect_uri,
+  state, scope=crm,user);
 * `/oauth/callback` — обменивает `code` на `access_token = vibe_session_*`
-  (`POST /v1/oauth/token` или `/v1/connect/token`, с `client_id` и
-  `code_verifier`) и сохраняет его в httpOnly-cookie **`vibe_session`**
+  (`POST /v1/oauth/token`) и сохраняет его в httpOnly-cookie **`vibe_session`**
   (Max-Age 24 ч);
 * сервер читает сессию из cookie `vibe_session` (`lib/session.js`) и передаёт её
   в запросы к `/v1/*` заголовком **`Authorization`**; рядом идёт ключ приложения
@@ -86,12 +84,10 @@
 * без сессии: `/api/*` → `401` без обращения к порталу, страница `/` →
   редирект на `/oauth/start`.
 
-Приложение регистрируется как **Connect-приложение Битрикс24** (публичный
-клиент, без секрета): в настройках указывается `redirect_uri =
-<APP_URL>/oauth/callback` (совпадение scheme/host/port/path), а в окружение
-задаются `APP_URL` и `VIBE_CLIENT_ID` (Client ID вида `vibe_partner_…`).
-Локально (без сессии) сервер работает по ключу приложения напрямую, что
-равносильно сервисному режиму владельца.
+Перед публикацией в настройках приложения в VibeCode регистрируется
+`redirect_uri = <APP_URL>/oauth/callback` (совпадение scheme/host/port/path), а
+в окружение задаётся `APP_URL`. Локально (без сессии) сервер работает по ключу
+приложения напрямую, что равносильно сервисному режиму владельца.
 
 ## Локальный запуск
 
