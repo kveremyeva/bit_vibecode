@@ -100,7 +100,21 @@ async function exchangeCode(code) {
     } catch {
       data = null;
     }
+    // Лог обмена token: статус и (санитарно) тело без чувствительных значений.
+    const sanitized = data
+      ? JSON.stringify({
+          error: data?.error?.code ?? null,
+          message: data?.error?.message ?? null,
+          ok: data?.ok ?? undefined,
+        })
+      : text.slice(0, 300);
+    console.log(`[oauth] /oauth/token -> HTTP ${res.status} :: ${sanitized}`);
     if (!res.ok) {
+      console.log(
+        `[oauth] token failed: code=${data?.error?.code ?? null} message=${
+          data?.error?.message ?? null
+        } status=${res.status}`,
+      );
       throw new PortalError(
         res.status === 401 ? "denied" : "portal_error",
         data?.error?.message || `oauth_token_${res.status}`,
@@ -552,6 +566,18 @@ const server = http.createServer(async (req, res) => {
       `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}` +
       `&state=${encodeURIComponent(state)}` +
       `&scope=${encodeURIComponent(OAUTH_SCOPE)}`;
+    // Пункт 1: проверка формирования URL (app_key маскируем, суть — параметры).
+    const maskKey = KEY.length > 8 ? `${KEY.slice(0, 8)}…${KEY.slice(-4)}` : "[short]";
+    console.log(
+      `[oauth] /oauth/start -> authorize\n` +
+        `  app_key        : ${maskKey}\n` +
+        `  redirect_uri   : ${REDIRECT_URI}\n` +
+        `  scope          : ${OAUTH_SCOPE}\n` +
+        `  state          : ${state}\n` +
+        `  url            : ${BASE}/oauth/authorize?app_key=${maskKey}&redirect_uri=${encodeURIComponent(
+          REDIRECT_URI,
+        )}&state=${state}&scope=${encodeURIComponent(OAUTH_SCOPE)}`,
+    );
     res.writeHead(302, { Location: authorizeUrl });
     res.end();
     return;
@@ -561,6 +587,21 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === "/oauth/callback") {
     const code = url.searchParams.get("code");
     const state = url.searchParams.get("state");
+    const error = url.searchParams.get("error") || null;
+    const errorDesc = url.searchParams.get("error_description") || null;
+    // Пункт 2: логируем query-параметры (code — частично, т.к. чувствителен).
+    const codeMask = code ? (code.length > 8 ? `${code.slice(0, 8)}…` : "[short]") : null;
+    console.log(
+      `[oauth] /oauth/callback -> code=${codeMask} state=${state} error=${
+        error ?? null
+      } error_description=${errorDesc ?? null}`,
+    );
+    if (error) {
+      console.log(`[oauth] authorize error: ${error} :: ${errorDesc ?? "—"}`);
+      res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end(`Авторизация отклонена: ${error} ${errorDesc ?? ""}`.trim());
+      return;
+    }
     if (!code || !state || !consumeState(state)) {
       res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
       res.end("Невалидные параметры OAuth-ответа (code/state).");
