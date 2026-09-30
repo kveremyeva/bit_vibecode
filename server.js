@@ -1,5 +1,5 @@
 import http from "node:http";
-import { randomBytes } from "node:crypto";
+import { randomBytes, createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
@@ -48,70 +48,90 @@ const PORTAL_TIMEOUT_MS = Number(process.env.PORTAL_TIMEOUT_MS || 180_000);
 const CACHE_MS = Number(process.env.CACHE_MS || 5 * 60_000);
 const AGG_LIMIT = 5000;
 
-// ---- OAuth-флоу (вариант А, сессия пользователя) --------------------------
-// BASE указывает на https://vibecode.bitrix24.tech/v1. В настройках приложения
-// в VibeCode должен быть зарегистрирован redirect_uri = APP_ORIGIN/oauth/callback.
+// ---- OAuth-флоу (вариант А, Connect-приложение Битрикс24 + PKCE) ----------
+// Приложение зарегистрировано как ПУБЛИЧНЫЙ connect-клиент (без секрета),
+// поэтому используется PKCE: /oauth/start генерирует code_verifier и
+// code_challenge (S256), редиректит на /v1/connect/authorize; /oauth/callback
+// обменивает code + code_verifier на access_token = vibe_session_*.
 const APP_BASE_URL = process.env.APP_URL || ""; // например https://app-<id>.vibecode.bitrix24.tech
 const REDIRECT_URI = `${APP_BASE_URL}/oauth/callback`;
-const OAUTH_SCOPE = "crm,user";
+const OAUTH_CLIENT_ID = process.env.VIBE_CLIENT_ID || ""; // vibe_partner_...
+const OAUTH_SCOPE = process.env.OAUTH_SCOPE || "crm,user";
 const SESSION_COOKIE = "vibe_session";
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 часа
-const stateStore = new Map(); // state -> { used:false, createdAt }
+const stateStore = new Map(); // state -> { used, createdAt, codeVerifier }
+
+function base64url(buf) {
+  return Buffer.from(buf).toString("base64url");
+}
+
+function pkcePair() {
+  const verifier = base64url(randomBytes(48)); // 64 символа base64url
+  const challenge = createHash("sha256").update(verifier).digest("base64url");
+  return { verifier, challenge };
+}
 
 function newState() {
-  const s = randomBytes(18).toString("base64url");
-  stateStore.set(s, { used: false, createdAt: Date.now() });
-  // подчистим старые (старше 10 минут)
+  const s = base64url(randomBytes(18));
+  const { verifier, challenge } = pkcePair();
+  stateStore.set(s, { used: false, createdAt: Date.now(), codeVerifier: verifier });
   for (const [k, v] of stateStore) {
     if (Date.now() - v.createdAt > 10 * 60 * 1000) stateStore.delete(k);
   }
-  return s;
+  return { state: s, challenge };
 }
 
 function consumeState(state) {
   const rec = stateStore.get(state);
-  if (!rec || rec.used) return false;
+  if (!rec || rec.used) return null;
   rec.used = true;
-  return true;
+  return rec.codeVerifier;
 }
 
-async function exchangeCode(code) {
-  if (!KEY || !BASE) throw new PortalError("no_key", "app key or proxy absent");
-  const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), PORTAL_TIMEOUT_MS);
-  try {
-    const res = await fetch(`${BASE}/oauth/token`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
-      },
-      body: JSON.stringify({
-        app_key: KEY,
-        code,
-        redirect_uri: REDIRECT_URI,
-      }),
-      signal: ctl.signal,
-    });
-    const text = await res.text();
-    let data = null;
+// Обмен code на токен. Пробуем /connect/token, затем /oauth/token — какой
+// отвечает 200 и возвращает access_token, тот и используем.
+async function exchangeCode(code, codeVerifier) {
+  if (!OAUTH_CLIENT_ID || !BASE) throw new PortalError("no_key", "oauth client/proxy absent");
+  const body = {
+    client_id: OAUTH_CLIENT_ID,
+    grant_type: "authorization_code",
+    code,
+    redirect_uri: REDIRECT_URI,
+    code_verifier: codeVerifier,
+  };
+  const paths = ["/oauth/token", "/connect/token"];
+  let lastErr = null;
+  for (const p of paths) {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), PORTAL_TIMEOUT_MS);
     try {
-      data = text ? JSON.parse(text) : null;
-    } catch {
-      data = null;
+      const res = await fetch(`${BASE}${p}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify(body),
+        signal: ctl.signal,
+      });
+      const text = await res.text();
+      let data = null;
+      try {
+        data = text ? JSON.parse(text) : null;
+      } catch {
+        data = null;
+      }
+      const token = data?.access_token ?? data?.data?.access_token ?? null;
+      if (res.ok && token) return { token, raw: data };
+      lastErr = { status: res.status, msg: data?.error?.message || text.slice(0, 200) };
+    } catch (err) {
+      lastErr = { status: null, msg: err.message };
+    } finally {
+      clearTimeout(timer);
     }
-    if (!res.ok) {
-      throw new PortalError(
-        res.status === 401 ? "denied" : "portal_error",
-        data?.error?.message || `oauth_token_${res.status}`,
-        res.status,
-      );
-    }
-    const token = data?.access_token ?? data?.data?.access_token ?? null;
-    return { token, raw: data };
-  } finally {
-    clearTimeout(timer);
   }
+  throw new PortalError(
+    lastErr?.status === 401 ? "denied" : "portal_error",
+    `token swap failed: ${JSON.stringify(lastErr)}`,
+    lastErr?.status ?? null,
+  );
 }
 
 console.log(
@@ -540,18 +560,20 @@ const server = http.createServer(async (req, res) => {
 
   // --- OAuth: start -------------------------------------------------------
   if (url.pathname === "/oauth/start") {
-    if (!APP_BASE_URL || !KEY) {
+    if (!APP_BASE_URL || !OAUTH_CLIENT_ID) {
       res.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" });
-      res.end("OAuth не настроен: задайте APP_URL и ключ приложения.");
+      res.end("OAuth не настроен: задайте APP_URL и VIBE_CLIENT_ID.");
       return;
     }
-    const state = newState();
+    const { state, challenge } = newState();
     const authorizeUrl =
-      `${BASE}/oauth/authorize` +
-      `?app_key=${encodeURIComponent(KEY)}` +
+      `${BASE}/connect/authorize` +
+      `?client_id=${encodeURIComponent(OAUTH_CLIENT_ID)}` +
       `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}` +
       `&state=${encodeURIComponent(state)}` +
-      `&scope=${encodeURIComponent(OAUTH_SCOPE)}`;
+      `&scope=${encodeURIComponent(OAUTH_SCOPE)}` +
+      `&code_challenge=${encodeURIComponent(challenge)}` +
+      `&code_challenge_method=S256`;
     res.writeHead(302, { Location: authorizeUrl });
     res.end();
     return;
@@ -561,13 +583,14 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === "/oauth/callback") {
     const code = url.searchParams.get("code");
     const state = url.searchParams.get("state");
-    if (!code || !state || !consumeState(state)) {
+    const codeVerifier = consumeState(state);
+    if (!code || !state || !codeVerifier) {
       res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
       res.end("Невалидные параметры OAuth-ответа (code/state).");
       return;
     }
     try {
-      const exchanged = await exchangeCode(code);
+      const exchanged = await exchangeCode(code, codeVerifier);
       if (!exchanged.token) {
         res.writeHead(502, { "Content-Type": "text/plain; charset=utf-8" });
         res.end("OAuth-обмен не вернул access_token.");
