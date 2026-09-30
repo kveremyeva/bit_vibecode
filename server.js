@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { sessionFrom, parseCookie } from "./lib/session.js";
 import { buildStageIndex, buildUsersIndex, isoRange, resolvePeriod } from "./lib/calc.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -186,10 +187,6 @@ const userCache = new Map(); // key -> { data, at, error, building }
 function cacheKey(req) {
   const id = req.headers["x-vibe-user-id"];
   return id && /^\d+$/.test(String(id)) ? `user:${id}` : "local";
-}
-
-function sessionFrom(req) {
-  return req.headers["x-vibe-authorization"] || null;
 }
 
 function getOrCreate(key) {
