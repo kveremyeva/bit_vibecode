@@ -1,4 +1,5 @@
 import http from "node:http";
+import { randomBytes } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
@@ -46,6 +47,72 @@ const PUBLIC_DIR = path.join(__dirname, "public");
 const PORTAL_TIMEOUT_MS = Number(process.env.PORTAL_TIMEOUT_MS || 180_000);
 const CACHE_MS = Number(process.env.CACHE_MS || 5 * 60_000);
 const AGG_LIMIT = 5000;
+
+// ---- OAuth-флоу (вариант А, сессия пользователя) --------------------------
+// BASE указывает на https://vibecode.bitrix24.tech/v1. В настройках приложения
+// в VibeCode должен быть зарегистрирован redirect_uri = APP_ORIGIN/oauth/callback.
+const APP_BASE_URL = process.env.APP_URL || ""; // например https://app-<id>.vibecode.bitrix24.tech
+const REDIRECT_URI = `${APP_BASE_URL}/oauth/callback`;
+const OAUTH_SCOPE = "crm,user";
+const SESSION_COOKIE = "vibe_session";
+const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 часа
+const stateStore = new Map(); // state -> { used:false, createdAt }
+
+function newState() {
+  const s = randomBytes(18).toString("base64url");
+  stateStore.set(s, { used: false, createdAt: Date.now() });
+  // подчистим старые (старше 10 минут)
+  for (const [k, v] of stateStore) {
+    if (Date.now() - v.createdAt > 10 * 60 * 1000) stateStore.delete(k);
+  }
+  return s;
+}
+
+function consumeState(state) {
+  const rec = stateStore.get(state);
+  if (!rec || rec.used) return false;
+  rec.used = true;
+  return true;
+}
+
+async function exchangeCode(code) {
+  if (!KEY || !BASE) throw new PortalError("no_key", "app key or proxy absent");
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), PORTAL_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${BASE}/oauth/token`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify({
+        app_key: KEY,
+        code,
+        redirect_uri: REDIRECT_URI,
+      }),
+      signal: ctl.signal,
+    });
+    const text = await res.text();
+    let data = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = null;
+    }
+    if (!res.ok) {
+      throw new PortalError(
+        res.status === 401 ? "denied" : "portal_error",
+        data?.error?.message || `oauth_token_${res.status}`,
+        res.status,
+      );
+    }
+    const token = data?.access_token ?? data?.data?.access_token ?? null;
+    return { token, raw: data };
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 console.log(
   `auth: ${KEY ? "app key from " + (KEY_FROM_ENVIRONMENT ? "env" : ENV_FILE) : "session of the signed-in user"} · proxy: ${
@@ -471,6 +538,75 @@ const server = http.createServer(async (req, res) => {
   const key = cacheKey(req);
   const session = sessionFrom(req);
 
+  // --- OAuth: start -------------------------------------------------------
+  if (url.pathname === "/oauth/start") {
+    if (!APP_BASE_URL || !KEY) {
+      res.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end("OAuth не настроен: задайте APP_URL и ключ приложения.");
+      return;
+    }
+    const state = newState();
+    const authorizeUrl =
+      `${BASE}/oauth/authorize` +
+      `?app_key=${encodeURIComponent(KEY)}` +
+      `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}` +
+      `&state=${encodeURIComponent(state)}` +
+      `&scope=${encodeURIComponent(OAUTH_SCOPE)}`;
+    res.writeHead(302, { Location: authorizeUrl });
+    res.end();
+    return;
+  }
+
+  // --- OAuth: callback ----------------------------------------------------
+  if (url.pathname === "/oauth/callback") {
+    const code = url.searchParams.get("code");
+    const state = url.searchParams.get("state");
+    if (!code || !state || !consumeState(state)) {
+      res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end("Невалидные параметры OAuth-ответа (code/state).");
+      return;
+    }
+    try {
+      const exchanged = await exchangeCode(code);
+      if (!exchanged.token) {
+        res.writeHead(502, { "Content-Type": "text/plain; charset=utf-8" });
+        res.end("OAuth-обмен не вернул access_token.");
+        return;
+      }
+      // Ставим httpOnly-куку с сессией и уходим на главную клиентским
+      // переходом (Set-Cookie на 302 шлюз не пробрасывает).
+      const cookie = `${SESSION_COOKIE}=${encodeURIComponent(
+        exchanged.token,
+      )}; HttpOnly; Path=/; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}; SameSite=Lax`;
+      res.writeHead(200, {
+        "Content-Type": "text/html; charset=utf-8",
+        "Set-Cookie": cookie,
+      });
+      res.end(
+        "<!doctype html><meta charset=utf-8><title>Вход выполнен</title>" +
+          "<p>Вход выполнен. Перенаправляем…</p>" +
+          "<script>window.location.replace('/');</script>",
+      );
+      return;
+    } catch (err) {
+      res.writeHead(err.status || 502, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end(`Не удалось завершить вход: ${err.message}`);
+      return;
+    }
+  }
+
+  // --- OAuth: выход (опционально) ------------------------------------------
+  if (url.pathname === "/oauth/logout") {
+    res.writeHead(200, {
+      "Content-Type": "text/html; charset=utf-8",
+      "Set-Cookie": `${SESSION_COOKIE}=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax`,
+    });
+    res.end(
+      "<!doctype html><meta charset=utf-8><p>Вы вышли. <a href='/oauth/start'>Войти</a></p>",
+    );
+    return;
+  }
+
   // --- /api/dashboard ------------------------------------------------------
   if (url.pathname === "/api/dashboard") {
     const entry = getOrCreate(key);
@@ -563,6 +699,14 @@ const server = http.createServer(async (req, res) => {
   const insidePublic = filePath === PUBLIC_DIR || filePath.startsWith(PUBLIC_DIR + path.sep);
   if (isDotfile || !insidePublic) {
     res.writeHead(403).end("Forbidden");
+    return;
+  }
+  // Страницы (HTML, в т.ч. "/") требуют сессии: без неё — редирект на OAuth.
+  const isHtml = path.extname(filePath) === ".html" || url.pathname === "/";
+  const localDev = Boolean(KEY) && !APP_BASE_URL; // локальный запуск без OAuth
+  if (isHtml && !session && !localDev) {
+    res.writeHead(302, { Location: "/oauth/start" });
+    res.end();
     return;
   }
   try {
