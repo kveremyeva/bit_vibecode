@@ -55,6 +55,7 @@ const APP_BASE_URL = process.env.APP_URL || ""; // например https://app-
 const REDIRECT_URI = `${APP_BASE_URL}/oauth/callback`;
 const OAUTH_SCOPE = "crm,user";
 const SESSION_COOKIE = "vibe_session";
+const OAUTH_STATE_COOKIE = "oauth_state";
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 часа
 const stateStore = new Map(); // state -> { used:false, createdAt }
 
@@ -578,8 +579,20 @@ const server = http.createServer(async (req, res) => {
           REDIRECT_URI,
         )}&state=${state}&scope=${encodeURIComponent(OAUTH_SCOPE)}`,
     );
-    res.writeHead(302, { Location: authorizeUrl });
-    res.end();
+    // Кука с state на не-редиректном 200 (шлюз 3xx не пробрасывает Set-Cookie),
+    // переход на authorize выполняет сам браузер.
+    const stateCookie = `${OAUTH_STATE_COOKIE}=${encodeURIComponent(
+      state,
+    )}; HttpOnly; Path=/; Max-Age=600; SameSite=Lax`;
+    res.writeHead(200, {
+      "Content-Type": "text/html; charset=utf-8",
+      "Set-Cookie": stateCookie,
+    });
+    res.end(
+      "<!doctype html><meta charset=utf-8><title>Вход…</title>" +
+        "<p>Перенаправляем на авторизацию…</p>" +
+        `<script>window.location.replace(${JSON.stringify(authorizeUrl)});</script>`,
+    );
     return;
   }
 
@@ -602,9 +615,18 @@ const server = http.createServer(async (req, res) => {
       res.end(`Авторизация отклонена: ${error} ${errorDesc ?? ""}`.trim());
       return;
     }
-    if (!code || !state || !consumeState(state)) {
+    // Сверяем state из query с state из cookie oauth_state (устойчиво к
+    // перезапускам сервера: state лежит и в httpOnly-cookie, а не только в
+    // памяти). Затем помечаем state использованным.
+    const cookieState = parseCookie(req.headers.cookie || "", OAUTH_STATE_COOKIE);
+    const stateOk = cookieState && state && cookieState === state && consumeState(state);
+    if (!code || !stateOk) {
       res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
-      res.end("Невалидные параметры OAuth-ответа (code/state).");
+      res.end(
+        `Невалидные параметры OAuth-ответа (code=${code ? "есть" : "нет"} state_ok=${
+          stateOk ? "да" : "нет"
+        }).`,
+      );
       return;
     }
     try {
