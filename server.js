@@ -42,6 +42,9 @@ const ENV_FILE = loadEnvUpwards(__dirname);
 const PORT = process.env.PORT || 3000;
 const BASE = process.env.BITRIX_API_BASE_URL || "";
 const KEY = process.env.BITRIX_API_KEY || "";
+// Авторизационный ключ приложения (vibe_app_…): используется как app_key в
+// OAuth и как X-Api-Key к данным портала. Приоритет — над BITRIX_API_KEY.
+const APP_KEY = process.env.VIBE_APP_KEY || KEY;
 const DOMAIN = process.env.BITRIX_PORTAL_DOMAIN || "";
 const PUBLIC_DIR = path.join(__dirname, "public");
 const PORTAL_TIMEOUT_MS = Number(process.env.PORTAL_TIMEOUT_MS || 180_000);
@@ -77,7 +80,7 @@ function consumeState(state) {
 }
 
 async function exchangeCode(code) {
-  if (!KEY || !BASE) throw new PortalError("no_key", "app key or proxy absent");
+  if (!APP_KEY || !BASE) throw new PortalError("no_key", "app key or proxy absent");
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), PORTAL_TIMEOUT_MS);
   try {
@@ -88,7 +91,7 @@ async function exchangeCode(code) {
         Accept: "application/json",
       },
       body: JSON.stringify({
-        app_key: KEY,
+        app_key: APP_KEY,
         code,
         redirect_uri: REDIRECT_URI,
       }),
@@ -130,7 +133,7 @@ async function exchangeCode(code) {
 }
 
 console.log(
-  `auth: ${KEY ? "app key from " + (KEY_FROM_ENVIRONMENT ? "env" : ENV_FILE) : "session of the signed-in user"} · proxy: ${
+  `auth: ${APP_KEY ? "app key from " + (KEY_FROM_ENVIRONMENT ? "env" : ENV_FILE) : "session of the signed-in user"} · proxy: ${
     BASE ? "configured" : "MISSING"
   }`,
 );
@@ -169,7 +172,7 @@ async function portal(pathname, { method = "GET", body, params, session } = {}) 
         headers: {
           Accept: "application/json",
           ...(session ? { "Authorization": session } : {}),
-          ...(KEY ? { "X-Api-Key": KEY } : {}),
+          ...(APP_KEY ? { "X-Api-Key": APP_KEY } : {}),
           ...(body ? { "Content-Type": "application/json" } : {}),
         },
         ...(body ? { body: JSON.stringify(body) } : {}),
@@ -555,7 +558,7 @@ const server = http.createServer(async (req, res) => {
 
   // --- OAuth: start -------------------------------------------------------
   if (url.pathname === "/oauth/start") {
-    if (!APP_BASE_URL || !KEY) {
+    if (!APP_BASE_URL || !APP_KEY) {
       res.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" });
       res.end("OAuth не настроен: задайте APP_URL и ключ приложения.");
       return;
@@ -563,12 +566,12 @@ const server = http.createServer(async (req, res) => {
     const state = newState();
     const authorizeUrl =
       `${BASE}/oauth/authorize` +
-      `?app_key=${encodeURIComponent(KEY)}` +
+      `?app_key=${encodeURIComponent(APP_KEY)}` +
       `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}` +
       `&state=${encodeURIComponent(state)}` +
       `&scope=${encodeURIComponent(OAUTH_SCOPE)}`;
     // Пункт 1: проверка формирования URL (app_key маскируем, суть — параметры).
-    const maskKey = KEY.length > 8 ? `${KEY.slice(0, 8)}…${KEY.slice(-4)}` : "[short]";
+    const maskKey = APP_KEY.length > 8 ? `${APP_KEY.slice(0, 8)}…${APP_KEY.slice(-4)}` : "[short]";
     console.log(
       `[oauth] /oauth/start -> authorize\n` +
         `  app_key        : ${maskKey}\n` +
@@ -679,7 +682,7 @@ const server = http.createServer(async (req, res) => {
 
     // С1: без сессии (и без локального ключа для разработки) — 401 сразу,
     // без обращения к порталу. Анонимный запрос данных не обслуживается.
-    if (!session && !KEY) {
+    if (!session && !APP_KEY) {
       writeJson(res, HTTP_BY_KIND.no_session, { error: TEXT_BY_KIND.no_session, kind: "no_session" });
       return;
     }
@@ -696,7 +699,7 @@ const server = http.createServer(async (req, res) => {
         if (session) entry.session = session;
         void buildSnapshotForKey(key, session);
       }
-      const canAuth = Boolean(session) || Boolean(KEY);
+      const canAuth = Boolean(session) || Boolean(APP_KEY);
       const kind = entry.error?.kind ?? (BASE && canAuth ? "loading" : "no_key");
       if (kind === "loading") {
         writeJson(res, 202, {
@@ -732,9 +735,9 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === "/api/health") {
     writeJson(res, 200, {
       status: "ok",
-      keyPresent: Boolean(KEY),
+      keyPresent: Boolean(APP_KEY),
       sessionPresent: Boolean(session),
-      authAvailable: Boolean(session) || Boolean(KEY),
+      authAvailable: Boolean(session) || Boolean(APP_KEY),
       baseUrlPresent: Boolean(BASE),
       portalTimeoutMs: PORTAL_TIMEOUT_MS,
       snapshot: {
@@ -766,7 +769,7 @@ const server = http.createServer(async (req, res) => {
   }
   // Страницы (HTML, в т.ч. "/") требуют сессии: без неё — редирект на OAuth.
   const isHtml = path.extname(filePath) === ".html" || url.pathname === "/";
-  const localDev = Boolean(KEY) && !APP_BASE_URL; // локальный запуск без OAuth
+  const localDev = Boolean(APP_KEY) && !APP_BASE_URL; // локальный запуск без OAuth
   if (isHtml && !session && !localDev) {
     res.writeHead(302, { Location: "/oauth/start" });
     res.end();
