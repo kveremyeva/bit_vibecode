@@ -35,16 +35,16 @@ function loadEnvUpwards(startDir, maxLevels = 4) {
 }
 
 const KEY_FROM_ENVIRONMENT =
-  typeof process.env.BITRIX_API_KEY === "string" &&
-  process.env.BITRIX_API_KEY !== "";
+  typeof process.env.VIBE_APP_KEY === "string" &&
+  process.env.VIBE_APP_KEY !== "";
 const ENV_FILE = loadEnvUpwards(__dirname);
 
 const PORT = process.env.PORT || 3000;
 const BASE = process.env.BITRIX_API_BASE_URL || "";
-const KEY = process.env.BITRIX_API_KEY || "";
-// Авторизационный ключ приложения (vibe_app_…): используется как app_key в
-// OAuth и как X-Api-Key к данным портала. Приоритет — над BITRIX_API_KEY.
-const APP_KEY = process.env.VIBE_APP_KEY || KEY;
+// Авторизационный ключ приложения (vibe_app_…) — единственный ключ для
+// OAuth (app_key) и для вызовов /v1/* (X-Api-Key), как требует документация
+// для embedded placement. Личный vibe_api_ для OAuth не используется.
+const APP_KEY = process.env.VIBE_APP_KEY || "";
 const DOMAIN = process.env.BITRIX_PORTAL_DOMAIN || "";
 const PUBLIC_DIR = path.join(__dirname, "public");
 const PORTAL_TIMEOUT_MS = Number(process.env.PORTAL_TIMEOUT_MS || 180_000);
