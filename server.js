@@ -733,6 +733,25 @@ const server = http.createServer(async (req, res) => {
   // --- /api/health ---------------------------------------------------------
   // M7: только факт наличия доступа, без путей и текстов ошибок.
   if (url.pathname === "/api/health") {
+    // Подтверждение текущего пользователя: если сессия есть — делаем
+    // внутренний GET /v1/me через portal(). Значения токена/ключа не отдаём.
+    let currentUser = null;
+    if (session) {
+      try {
+        const me = await portal("/me", { session });
+        const data = me.raw?.data ?? me.raw ?? {};
+        const cu = data.currentUser ?? null;
+        if (cu) {
+          currentUser = {
+            bitrixUserId:
+              cu.bitrixUserId ?? cu.id ?? cu.bitrixUserId ?? null,
+            portal: data.portal ?? cu.portal ?? null,
+          };
+        }
+      } catch {
+        // Сессия могла протухнуть; currentUser остаётся null, сбой не маскируем.
+      }
+    }
     writeJson(res, 200, {
       status: "ok",
       keyPresent: Boolean(APP_KEY),
@@ -740,6 +759,7 @@ const server = http.createServer(async (req, res) => {
       authAvailable: Boolean(session) || Boolean(APP_KEY),
       baseUrlPresent: Boolean(BASE),
       portalTimeoutMs: PORTAL_TIMEOUT_MS,
+      ...(currentUser ? { currentUser } : {}),
       snapshot: {
         updatedAt:
           userCache.get(key)?.at
